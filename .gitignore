@@ -1,0 +1,6 @@
+*.key
+*.env
+*.enc
+*.log
+*.conf
+*.yaml
