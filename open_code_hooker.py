@@ -1,14 +1,84 @@
 import asyncio
+import os
+import uuid as _uuid_mod
+
 import httpx
-from fastapi import FastAPI, Request, status
+
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+from credential_manager import CredentialManager, constant_time_contains
 
 # Initialize FastAPI App
 app = FastAPI(
     title="OpenCode-to-LlamaCPP-Proxy",
     description="Production-ready middleware tunneling OpenCode requests to a headless llama.cpp server."
 )
+
+# ---------------------------------------------------------------------------
+# Authentication configuration
+# Credentials are UUIDs stored in an AES-GCM encrypted file (credentials.enc).
+# Only the holder of the master key (key.key or OPENCODE_CRED_KEY env var) can
+# decrypt it and check whether a presented credential exists.
+# Set AUTH_ENABLED=0 to run without authentication (e.g., local dev only).
+# ---------------------------------------------------------------------------
+CREDENTIAL_FILE = os.environ.get("OPENCODE_CRED_FILE", "credentials.enc")
+KEY_FILE = os.environ.get("OPENCODE_CRED_KEYFILE", "key.key")
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "1") != "0"
+
+_credential_manager: CredentialManager | None = None
+
+
+def get_credentials() -> list[str]:
+    """Lazily load the decrypted UUID credential list."""
+    global _credential_manager
+    if _credential_manager is None:
+        _credential_manager = CredentialManager(CREDENTIAL_FILE, KEY_FILE)
+    return _credential_manager.load()
+
+
+# Credentials may be sent as `Authorization: Bearer <uuid>` (standard, works with
+# OpenAI-compatible clients via apiKey) or the explicit `X-OpenCode-Credential` header.
+
+def authenticate(request: Request) -> str:
+    """Validate the request's UUID credential against the encrypted store."""
+    if not AUTH_ENABLED:
+        return "auth-disabled"
+
+    raw_token = (request.headers.get("authorization") or request.headers.get("x-opencode-credential") or "").strip()
+    # Normalize the optional `Bearer` prefix so both header styles work.
+    if raw_token[:7].lower() == "bearer ":
+        raw_token = raw_token[7:].strip()
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing credential",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        candidate_uuid = str(_uuid_mod.UUID(raw_token))  # canonicalize; raises on bad input
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credential format (expected a UUID)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        stored = get_credentials()
+    except Exception as exc:  # missing/corrupt store or wrong key -> fail closed
+        raise HTTPException(status_code=500, detail=f"Credential store unavailable: {exc}")
+
+    if not constant_time_contains(stored, candidate_uuid):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Credential not recognized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return candidate_uuid
 
 # Configure CORS to allow inbound connections from OpenCode clients/headless daemons
 app.add_middleware(
@@ -25,10 +95,12 @@ LLAMA_SERVER_URL = "http://127.0.0.1:9931"
 TIMEOUT_SETTINGS = httpx.Timeout(300.0, connect=10.0) # Long timeout to allow for deep context processing
 
 @app.post("/xxx/v1/chat/completions")
-async def proxy_chat_completions(request: Request):
+async def proxy_chat_completions(request: Request, credential: str = Depends(authenticate)):
     """
     Intercepts OpenAI-compatible completions payloads from OpenCode 
     and pipes them downstream to the llama.cpp instance while preserving streaming chunks.
+
+    Requires a valid UUID credential (Authorization: Bearer <uuid>).
     """
     body = await request.json()
     
@@ -92,10 +164,12 @@ async def handle_opencode_telemetry(request: Request):
 
 @app.api_route("/chat/completions", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-async def catch_all_falback(request: Request, path: str):
+async def catch_all_falback(request: Request, path: str, credential: str = Depends(authenticate)):
     """
     Catch-all route that dynamically forwards any other unmapped endpoints 
     (e.g., /v1/models) straight to the llama.cpp engine.
+
+    Requires a valid UUID credential (Authorization: Bearer <uuid>).
     """
     if request.method == "OPTIONS":
         return JSONResponse(content={}, status_code=status.HTTP_200_OK)
@@ -123,5 +197,5 @@ async def catch_all_falback(request: Request, path: str):
 if __name__ == "__main__":
     import uvicorn
     # Bind to 0.0.0.0 so your local SSH tunnel can resolve traffic directed to 10.0.0.12
-    uvicorn.run("proxy:app", host="0.0.0.0", port=8082, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8082, reload=False)
 
